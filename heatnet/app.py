@@ -35,6 +35,7 @@ from .secondary.cycle import run_cycle
 from .secondary.loop import SecondaryLoop
 from .sequence import advance_heating, dispatch_demand, recalibrate_flow, shutdown_plant, startup_plant
 from .source.adjust import Adjustment, apply_adjustment
+from .source.coupling import BAND_MODE, CouplingLimits, evaluate, load_segment
 from .source.source import HeatSource
 from .source.weather import WeatherPush, push_weather
 from .station.batch import build_plan
@@ -116,6 +117,10 @@ class Platform:
         self._cycles = 0
         self._operations = 0
         self._lock = threading.RLock()
+        # 流量回读状态：缺失属于部分失败，联动闸门在此态下只许降不许升。
+        self._flow_readback_ok = True
+        # 最近一次联动限速结论：控制台展示与审计落盘共用这同一份数据。
+        self._last_coupling: dict | None = None
         self._register_namespaces()
         self._restore()
 
@@ -352,13 +357,51 @@ class Platform:
     def adjust_source(
         self, temperature_c: float, flow_t_h: float, origin: str = "manual"
     ) -> dict:
-        """把热源供温与流量原子地调整到目标值。"""
+        """把热源供温与流量原子地调整到目标值。
+
+        联动限速闸门在写入前裁决：固定温差带、负荷段让步方向、联合限速与回读
+        降级（只降不升）任一不满足，温度与流量一个都不写，一次网也不跟随。
+        闸门结论同时进控制台快照与审计，两份数据同口径。
+        """
 
         with self._lock:
-            adjustment: Adjustment = apply_adjustment(self.source, temperature_c, flow_t_h, origin)
+            snapshot = self.source.snapshot()
+            decision = evaluate(
+                CouplingLimits.from_source(self.config.source),
+                snapshot.origin_temp_c,
+                snapshot.origin_flow_t_h,
+                snapshot.temperature_c,
+                snapshot.flow_t_h,
+                float(temperature_c),
+                float(flow_t_h),
+                self.network.baseline_t_h(),
+                readback_ok=self._flow_readback_ok,
+                dt=None,
+            )
+            coupling = decision.as_dict()
+            self._last_coupling = coupling
+            adjustment: Adjustment = apply_adjustment(
+                self.source, temperature_c, flow_t_h, origin, decision
+            )
+            # 时序：调质调量整体放行之后，一次网才跟随；被拒绝则完全不跟随。
             if adjustment.ok:
                 self.network.set_supply(adjustment.temperature_c)
                 self.network.set_flow(adjustment.flow_t_h)
+            self.bus.publish(
+                Event.of(
+                    "source",
+                    "source",
+                    "coupling_guard",
+                    severity="notice" if adjustment.ok else "alarm",
+                    message=(
+                        f"联动限速放行（{origin}）"
+                        if adjustment.ok
+                        else f"联动限速拒绝（{origin}）：{'、'.join(adjustment.violations)}"
+                    ),
+                    origin=origin,
+                    **self._flat_coupling(coupling),
+                )
+            )
             self.bus.publish(
                 Event.of(
                     "source",
@@ -375,6 +418,42 @@ class Platform:
             )
             self._persist()
             return adjustment.as_dict()
+
+    @staticmethod
+    def _flat_coupling(coupling: dict) -> dict:
+        """把联动结论压成审计可落盘的扁平字段（列表/窗口转标量）。"""
+
+        flat = {
+            key: value
+            for key, value in coupling.items()
+            if not isinstance(value, (dict, list, tuple))
+        }
+        window = coupling.get("allowed_flow_window_t_h") or [None, None]
+        flat["allowed_flow_window_lo_t_h"] = window[0]
+        flat["allowed_flow_window_hi_t_h"] = window[1]
+        flat["violations"] = "|".join(coupling.get("violations", []))
+        return flat
+
+    def flow_readback(self, ok: bool) -> dict:
+        """登记一次网流量回读状态。
+
+        回读缺失是部分失败：不触发停机，但联动限速立刻进入只降不升的降级态，
+        任何要求流量上升的调质调量都会被当场拒绝。
+        """
+
+        with self._lock:
+            self._flow_readback_ok = bool(ok)
+            self.bus.publish(
+                Event.of(
+                    "primary",
+                    "primary",
+                    "flow_readback",
+                    severity="notice" if ok else "warning",
+                    message="流量回读正常" if ok else "流量回读缺失：联动限速只降不升",
+                    readback_ok=self._flow_readback_ok,
+                )
+            )
+            return {"readback_ok": self._flow_readback_ok, "down_only": not self._flow_readback_ok}
 
     def dispatch(
         self,
@@ -627,8 +706,33 @@ class Platform:
             moment = self.clock.now()
             flow = self.source.flow_t_h() or self.network.flow_t_h()
             report = advance_heating(
-                self.source, self.curve, self.network, self.secondary, flow, moment, dt
+                self.source,
+                self.curve,
+                self.network,
+                self.secondary,
+                flow,
+                moment,
+                dt,
+                readback_ok=self._flow_readback_ok,
             )
+            if report.get("coupling") is not None:
+                self._last_coupling = report["coupling"]
+                self.bus.publish(
+                    Event.of(
+                        "source",
+                        "source",
+                        "coupling_guard",
+                        severity="notice" if report.get("ok") else "alarm",
+                        message=(
+                            "联动限速放行（cycle）"
+                            if report.get("ok")
+                            else "联动限速拒绝（cycle）："
+                            + "、".join(report.get("violations", []))
+                        ),
+                        origin="cycle",
+                        **self._flat_coupling(report["coupling"]),
+                    )
+                )
             self.trend.append("supply_c", moment, self.source.temperature_c())
             self.trend.append("return_c", moment, self.secondary.return_c())
             self.trend.append("network_flow_t_h", moment, self.network.flow_t_h())
@@ -736,6 +840,33 @@ class Platform:
         points = build_forecast(self.curve.table, outside, steps=steps)
         return {"start_outdoor_c": round(outside, 2), **describe_forecast(points)}
 
+    def coupling_report(self) -> dict:
+        """返回联动限速状态：固定带制式、联合限速、当前裁决与回读降级态。"""
+
+        limits = self.config.source
+        snapshot = self.source.snapshot()
+        coupling_limits = CouplingLimits.from_source(limits)
+        segment = load_segment(
+            snapshot.flow_t_h, self.network.baseline_t_h(), coupling_limits
+        )
+        return {
+            "band_mode": BAND_MODE,
+            "band_c": limits.coupling_band_c,
+            "flow_per_c": limits.coupling_flow_per_c,
+            "temp_rate_c_s": limits.adjust_rate_c_s,
+            "flow_rate_t_h_s": limits.coupling_flow_rate_t_h_s,
+            "low_load_pct": limits.low_load_pct,
+            "high_load_pct": limits.high_load_pct,
+            "load_segment": segment,
+            "readback_ok": self._flow_readback_ok,
+            "down_only": not self._flow_readback_ok,
+            "origin": {
+                "temperature_c": round(snapshot.origin_temp_c, 2),
+                "flow_t_h": round(snapshot.origin_flow_t_h, 2),
+            },
+            "last_decision": self._last_coupling,
+        }
+
     def pressure_report(self) -> dict:
         """返回定压基线与二次网定压报告。"""
 
@@ -786,6 +917,7 @@ class Platform:
                 "quality_confirmed": self.source.quality_confirmed(),
                 "trips": self.source.trips(),
             },
+            "coupling": self.coupling_report(),
             "curve": self.curve_report(),
             "primary": {
                 **self.network.snapshot().as_dict(),

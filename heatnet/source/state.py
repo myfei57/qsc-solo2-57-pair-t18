@@ -16,6 +16,8 @@ class SourceSnapshot:
     quality_hold_s: float
     adjustments: int
     trip_reason: str
+    origin_temp_c: float = 0.0
+    origin_flow_t_h: float = 0.0
 
     def as_dict(self) -> dict:
         return {
@@ -26,4 +28,6 @@ class SourceSnapshot:
             "quality_hold_s": round(self.quality_hold_s, 3),
             "adjustments": self.adjustments,
             "trip_reason": self.trip_reason,
+            "origin_temp_c": round(self.origin_temp_c, 2),
+            "origin_flow_t_h": round(self.origin_flow_t_h, 2),
         }

@@ -46,6 +46,8 @@ def startup_plant(
     if not weather["ok"]:
         return {"ok": False, "steps": steps, "violations": violations, "stage": "weather"}
 
+    # 曲线换代（且与当前实际供温有温差）就开联动调作；冷态点火装定目标后，
+    # 这里按固定带把温度与流量一起带向目标。
     for _ in range(MAX_STEPS):
         source.settle_quality(curve.supply_c(), dt)
         if source.quality_confirmed():
@@ -71,6 +73,11 @@ def startup_plant(
     except PlantError as error:
         violations.append(error.message)
         return {"ok": False, "steps": steps, "violations": violations, "stage": "quantity"}
+    # 投运的调质→调量是确认后的离散状态迁移，不是联动斜坡；迁移完成后把联动
+    # 调作起点钉在已带负荷位置，后续控制周期的固定带从这里量累计漂移。
+    source.mark_origin()
+    # 当前曲线已由投运过程消化，控制周期不要把这条曲线再当成新调作重做一遍。
+    source.note_curve_epoch(curve.epoch())
     network.set_supply(source.temperature_c())
     network.set_return(loop.return_c())
     network.set_flow(source.flow_t_h())

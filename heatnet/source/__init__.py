@@ -8,8 +8,27 @@
 from __future__ import annotations
 
 from .adjust import Adjustment, apply_adjustment
+from .coupling import (
+    BAND_MODE,
+    CouplingDecision,
+    CouplingLimits,
+    evaluate,
+    load_segment,
+)
 from .source import HeatSource
 from .state import SourceSnapshot
 from .weather import WeatherPush, push_weather
 
-__all__ = ["Adjustment", "HeatSource", "SourceSnapshot", "WeatherPush", "apply_adjustment", "push_weather"]
+__all__ = [
+    "Adjustment",
+    "BAND_MODE",
+    "CouplingDecision",
+    "CouplingLimits",
+    "HeatSource",
+    "SourceSnapshot",
+    "WeatherPush",
+    "apply_adjustment",
+    "evaluate",
+    "load_segment",
+    "push_weather",
+]

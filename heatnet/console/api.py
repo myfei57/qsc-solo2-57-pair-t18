@@ -46,6 +46,7 @@ class Api:
         add("GET", "/api/station/{name}", self._station)
         add("GET", "/api/valves", self._valves)
         add("GET", "/api/curve", self._curve)
+        add("GET", "/api/coupling", lambda params, body: self._platform.coupling_report())
         add("GET", "/api/forecast", self._forecast)
         add("GET", "/api/pressure", self._pressure)
         add("GET", "/api/quota", self._quota)
@@ -73,6 +74,7 @@ class Api:
         add("POST", "/api/valve/replay", self._replay)
         add("POST", "/api/pump", self._pump)
         add("POST", "/api/disturb", self._disturb)
+        add("POST", "/api/readback", self._readback)
         add("POST", "/api/trip", self._trip)
         add("POST", "/api/reset", self._reset)
         add("POST", "/api/concurrency", self._concurrency)
@@ -329,6 +331,10 @@ class Api:
 
     def _disturb(self, params: dict, body: dict) -> dict:
         return self._platform.disturb_secondary(_as_float(body, "heat_fraction", 0.5))
+
+    def _readback(self, params: dict, body: dict) -> dict:
+        ok = bool(body.get("ok", body.get("readback_ok", True)))
+        return self._platform.flow_readback(ok)
 
     def _trip(self, params: dict, body: dict) -> dict:
         return self._platform.trip(str(body.get("reason", "overtemperature")))

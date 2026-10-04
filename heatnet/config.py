@@ -51,6 +51,12 @@ class SourceLimits:
     flow_max_t_h: float
     quality_confirm_s: float
     adjust_rate_c_s: float
+    # 调质调量联动限速（固定温差带）：带形与斜率装配后定死，运行期不存在动态带。
+    coupling_band_c: float
+    coupling_flow_per_c: float
+    coupling_flow_rate_t_h_s: float
+    low_load_pct: float
+    high_load_pct: float
 
     @classmethod
     def from_mapping(cls, section: Mapping[str, Any]) -> "SourceLimits":
@@ -62,6 +68,11 @@ class SourceLimits:
             flow_max_t_h=_number(section, "flow_max_t_h", minimum=1.0),
             quality_confirm_s=_number(section, "quality_confirm_s", minimum=0.1),
             adjust_rate_c_s=_number(section, "adjust_rate_c_s", minimum=0.01),
+            coupling_band_c=_number(section, "coupling_band_c", minimum=0.1),
+            coupling_flow_per_c=_number(section, "coupling_flow_per_c", minimum=0.1),
+            coupling_flow_rate_t_h_s=_number(section, "coupling_flow_rate_t_h_s", minimum=0.1),
+            low_load_pct=_number(section, "low_load_pct", minimum=0.0),
+            high_load_pct=_number(section, "high_load_pct", minimum=0.0),
         )
         if limits.supply_target_c >= limits.supply_max_c:
             raise ConfigError("热源目标供温必须低于上限", component="config")
@@ -69,6 +80,8 @@ class SourceLimits:
             raise ConfigError("回水下限必须低于目标供温", component="config")
         if limits.flow_min_t_h >= limits.flow_max_t_h:
             raise ConfigError("流量下限必须小于上限", component="config")
+        if not 0.0 < limits.low_load_pct < limits.high_load_pct <= 100.0:
+            raise ConfigError("负荷段门限必须满足 0 < low_load_pct < high_load_pct <= 100", component="config")
         return limits
 
     def overtemperature(self, temperature_c: float) -> bool:
@@ -336,7 +349,14 @@ def default_config() -> PlatformConfig:
     return PlatformConfig(
         name="heatnet",
         storage_root="var/state",
-        source=SourceLimits(92.0, 115.0, 35.0, 900.0, 4200.0, 12.0, 0.35),
+        source=SourceLimits(
+            92.0, 115.0, 35.0, 900.0, 4200.0, 12.0, 0.35,
+            coupling_band_c=3.0,
+            coupling_flow_per_c=40.0,
+            coupling_flow_rate_t_h_s=30.0,
+            low_load_pct=40.0,
+            high_load_pct=75.0,
+        ),
         curve=CurveLimits(-26.0, 18.0, 55.0, 95.0, 1800.0),
         station=StationLimits(60.0, 2.5, 9.0, 8.0),
         primary=PrimaryLimits(2400.0, 180.0, 4.0),
@@ -362,6 +382,11 @@ def config_to_mapping(cfg: PlatformConfig) -> dict:
                 "flow_max_t_h": cfg.source.flow_max_t_h,
                 "quality_confirm_s": cfg.source.quality_confirm_s,
                 "adjust_rate_c_s": cfg.source.adjust_rate_c_s,
+                "coupling_band_c": cfg.source.coupling_band_c,
+                "coupling_flow_per_c": cfg.source.coupling_flow_per_c,
+                "coupling_flow_rate_t_h_s": cfg.source.coupling_flow_rate_t_h_s,
+                "low_load_pct": cfg.source.low_load_pct,
+                "high_load_pct": cfg.source.high_load_pct,
             },
             "curve": {
                 "outdoor_min_c": cfg.curve.outdoor_min_c,

@@ -35,6 +35,13 @@ class HeatSource:
         self._adjustments = 0
         self._trip_reason = ""
         self._trips = 0
+        # 联动限速的"调作起点"：目标改变时重新标记，固定带按它量累计漂移。
+        self._origin_temp_c = self._temperature_c
+        self._origin_flow_t_h = self._flow_t_h
+        # 调作的配对流量目标：与调质目标一起推进，没有配对目标时随当前流量。
+        self._target_flow_t_h = self._flow_t_h
+        # 最近一次按曲线开调作时看到的曲线代际（供控制周期判断是否要开新调作）。
+        self._curve_epoch = 0
 
     @property
     def limits(self) -> SourceLimits:
@@ -76,6 +83,49 @@ class HeatSource:
         with self._guard:
             return self._adjustments
 
+    def target_flow_t_h(self) -> float:
+        """返回本次联动调作的配对流量目标。"""
+
+        with self._guard:
+            return self._target_flow_t_h
+
+    def begin_maneuver(self, target_c: float, target_flow_t_h: float) -> tuple[float, float]:
+        """开启一段联动调作：标记新的调质/调量目标并以当前位置为起点。"""
+
+        with self._guard:
+            self._target_c = float(target_c)
+            self._target_flow_t_h = float(target_flow_t_h)
+            self._origin_temp_c = self._temperature_c
+            self._origin_flow_t_h = self._flow_t_h
+            return self._target_c, self._target_flow_t_h
+
+    def curve_epoch(self) -> int:
+        """返回最近一次据此开调作的曲线代际。"""
+
+        with self._guard:
+            return self._curve_epoch
+
+    def note_curve_epoch(self, epoch: int) -> int:
+        """记录本周期已处理过的曲线代际。"""
+
+        with self._guard:
+            self._curve_epoch = int(epoch)
+            return self._curve_epoch
+
+    def origin(self) -> tuple[float, float]:
+        """返回本次联动调作起点（供温, 流量）。"""
+
+        with self._guard:
+            return self._origin_temp_c, self._origin_flow_t_h
+
+    def mark_origin(self) -> tuple[float, float]:
+        """以当前温度与流量标记新的联动调作起点（目标改变时调用）。"""
+
+        with self._guard:
+            self._origin_temp_c = self._temperature_c
+            self._origin_flow_t_h = self._flow_t_h
+            return self._origin_temp_c, self._origin_flow_t_h
+
     def trip_reason(self) -> str:
         """返回最近一次停机原因。"""
 
@@ -97,7 +147,11 @@ class HeatSource:
                 raise InterlockError("调质目标越上限", component="source")
             if value < self._limits.return_min_c:
                 raise InterlockError("调质目标低于回水下限", component="source")
-            self._target_c = value
+            if value != self._target_c:
+                self._target_c = value
+                # 新目标就是新调作：固定带从当前位置重新量，避免沿用上一段的漂移。
+                self._origin_temp_c = self._temperature_c
+                self._origin_flow_t_h = self._flow_t_h
             return self._target_c
 
     def adjust(self, temperature_c: float, flow_t_h: float) -> tuple[float, float]:
@@ -114,7 +168,41 @@ class HeatSource:
                 raise InterlockError("调整后的流量越界", component="source")
             self._temperature_c = temperature
             self._flow_t_h = flow
+            self._target_flow_t_h = flow
             self._adjustments += 1
+            return self._temperature_c, self._flow_t_h
+
+    def coupled_step(self, temperature_c: float, flow_t_h: float, target_c: float, dt: float = 1.0) -> tuple[float, float]:
+        """联动限速放行后的一步调质调量：温度与流量在同一把锁里一起写。
+
+        只负责原子写入与绝对边界；固定带、联合限速、回读降级由联动闸门
+        （:mod:`heatnet.source.coupling`）在调用前裁决，裁决拒绝不得走到这里。
+        写后按温度是否到位更新调质确认计时与状态机。
+        """
+
+        if dt <= 0:
+            raise ValueError("步长必须为正")
+        with self._guard:
+            if self._state == TRIPPED:
+                raise InterlockError(f"热源已停机（{self._trip_reason}），禁止调整", component="source")
+            temperature = float(temperature_c)
+            flow = float(flow_t_h)
+            if self._limits.overtemperature(temperature):
+                raise InterlockError("调整后的供温越上限", component="source")
+            if not self._limits.flow_in_range(flow):
+                raise InterlockError("调整后的流量越界", component="source")
+            self._target_c = float(target_c)
+            self._temperature_c = temperature
+            self._flow_t_h = flow
+            self._adjustments += 1
+            if abs(self._temperature_c - self._target_c) <= 1e-9:
+                self._quality_hold_s += dt
+            else:
+                self._quality_hold_s = 0.0
+            if self._quality_hold_s < self._limits.quality_confirm_s:
+                self._state = QUALITY
+            elif self._state != ONLINE:
+                self._state = QUANTITY
             return self._temperature_c, self._flow_t_h
 
     def settle_quality(self, target_c: float, dt: float) -> float:
@@ -158,6 +246,7 @@ class HeatSource:
             if not self._limits.flow_in_range(value):
                 raise InterlockError("调量目标越界", component="source")
             self._flow_t_h = value
+            self._target_flow_t_h = value
             self._state = ONLINE
             return self._flow_t_h
 
@@ -171,9 +260,13 @@ class HeatSource:
             if self._limits.overtemperature(value):
                 raise InterlockError("曲线供温越上限，拒绝点火", component="source")
             self._target_c = value
-            self._temperature_c = value
+            # 点火只"装定"曲线目标，实际供温不允许脱离流量一步跳到位：温度与
+            # 流量由联动限速一起带上去。新曲线即新调作，固定带从当前位置量起。
+            self._origin_temp_c = self._temperature_c
+            self._origin_flow_t_h = self._flow_t_h
+            self._target_flow_t_h = self._flow_t_h
             self._state = QUANTITY if self.quality_confirmed() else QUALITY
-            return self._temperature_c
+            return self._target_c
 
     def trip(self, reason: str) -> str:
         """停机并记录原因。"""
@@ -183,6 +276,7 @@ class HeatSource:
             self._trip_reason = str(reason)
             self._trips += 1
             self._flow_t_h = 0.0
+            self._target_flow_t_h = 0.0
             return self._state
 
     def reset(self) -> str:
@@ -208,4 +302,6 @@ class HeatSource:
                 quality_hold_s=self._quality_hold_s,
                 adjustments=self._adjustments,
                 trip_reason=self._trip_reason,
+                origin_temp_c=self._origin_temp_c,
+                origin_flow_t_h=self._origin_flow_t_h,
             )

@@ -55,12 +55,32 @@ def test_api_bad_request_and_interlock(platform):
 
 def test_api_weather_adjust_and_readiness(platform):
     api = Api(platform)
-    status, weather = api.handle("POST", "/api/weather", {}, {"outdoor_c": -9.0})
-    assert status == 200
-    assert weather["ok"] is True
-    status, adjusted = api.handle("POST", "/api/adjust", {}, {"temperature_c": 88.0, "flow_t_h": 1500.0})
+    platform.start()
+    platform.push_weather(-9.0)
+    platform.startup(-9.0, 60.0)
+    # 联动限速固定带内的调质调量对：温度 +2.5C 配流量 +100 t/h（40 t/h·°C，带 3C）
+    start_temp = platform.source.temperature_c()
+    start_flow = platform.source.flow_t_h()
+    status, adjusted = api.handle(
+        "POST",
+        "/api/adjust",
+        {},
+        {"temperature_c": start_temp + 2.5, "flow_t_h": start_flow + 100.0},
+    )
     assert status == 200
     assert adjusted["ok"] is True
+    assert adjusted["coupling"]["band_mode"] == "fixed"
+    # 越带请求当场拒绝，且不写热源
+    status, rejected = api.handle(
+        "POST",
+        "/api/adjust",
+        {},
+        {"temperature_c": start_temp + 2.5, "flow_t_h": start_flow + 500.0},
+    )
+    assert status == 200
+    assert rejected["ok"] is False
+    assert rejected["coupling"]["allowed"] is False
+    assert rejected["flow_t_h"] == round(start_flow + 100.0, 2)
     status, ready = api.handle("GET", "/api/readiness", {}, {})
     assert status == 200
     assert ready["checks"]["curve_fresh"] is True
