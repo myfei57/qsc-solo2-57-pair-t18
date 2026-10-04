@@ -20,6 +20,7 @@ class PrimaryNetwork:
         self._return_c = 0.0
         self._flow_t_h = 0.0
         self._baseline_t_h = limits.flow_baseline_t_h
+        self._readback_missing = False
         self._recalibrations = 0
         self._dispatches = 0
 
@@ -67,6 +68,19 @@ class PrimaryNetwork:
 
         return self._dispatches
 
+    def readback_missing(self) -> bool:
+        """流量回读当前是否缺失（部分失败：联动只许降不许升）。"""
+
+        return self._readback_missing
+
+    def report_flow_readback(self, present: bool, measured_t_h: float | None = None) -> bool:
+        """登记流量回读状态；恢复时可带上恢复后的实测读值，返回回读是否可信。"""
+
+        self._readback_missing = not bool(present)
+        if not self._readback_missing and measured_t_h is not None:
+            self.set_flow(measured_t_h)
+        return not self._readback_missing
+
     def set_supply(self, temperature_c: float) -> float:
         """更新一次网供水温度。"""
 
@@ -113,6 +127,7 @@ class PrimaryNetwork:
             baseline_t_h=self._baseline_t_h,
             threshold_t_h=self.threshold_t_h(),
             low_flow=self.low_flow(),
+            readback_missing=self._readback_missing,
             recalibrations=self._recalibrations,
             dispatches=self._dispatches,
         )

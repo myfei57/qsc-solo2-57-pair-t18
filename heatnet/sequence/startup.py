@@ -1,8 +1,10 @@
 """投运编排。
 
-气象推送必须先更新曲线，热源再按新曲线调质；调质确认之后才允许调量，调量完成
-一次网才跟随；随后按"先补后定"把压力拉回目标带，最后跑一个循环建立流量。任何
-一步失败都停在原地，不带着半截状态继续往下走。
+气象推送必须先更新曲线，热源再按新曲线点火；随后调质调量按固定联合限速带
+联动爬坡——供温先进固定温差带并保持确认，流量才允许一步点火，之后两轴在
+同一允许矩形里一起逼近目标；联动到位之后一次网才跟随。随后按"先补后定"把
+压力拉回目标带，最后跑一个循环建立流量。任何一步失败都停在原地，不带着
+半截状态继续往下走。
 """
 
 from __future__ import annotations
@@ -46,31 +48,48 @@ def startup_plant(
     if not weather["ok"]:
         return {"ok": False, "steps": steps, "violations": violations, "stage": "weather"}
 
+    demand = max(0.0, min(1.0, demand_pct / 100.0))
+    flow_target = network.baseline_t_h() * demand
+    try:
+        source.set_flow_target(flow_target)
+    except PlantError as error:
+        violations.append(error.message)
+        return {"ok": False, "steps": steps, "violations": violations, "stage": "quantity"}
+
+    rate_limit = None
     for _ in range(MAX_STEPS):
-        source.settle_quality(curve.supply_c(), dt)
-        if source.quality_confirmed():
+        move = source.joint_step(dt, demand_pct, readback_missing=network.readback_missing())
+        rate_limit = move["rate_limit"]
+        violations.extend(move["violations"])
+        if violations:
+            steps.append({"component": "source", "action": "joint_ramp", "detail": rate_limit})
+            return {"ok": False, "steps": steps, "violations": violations, "stage": "source"}
+        if (
+            abs(source.temperature_c() - source.target_c()) <= 1e-6
+            and abs(source.flow_t_h() - flow_target) <= 1e-6
+        ):
             break
     steps.append(
         {
             "component": "source",
-            "action": "confirm_quality",
+            "action": "joint_ramp",
             "detail": {
                 "temperature_c": round(source.temperature_c(), 2),
+                "flow_t_h": round(source.flow_t_h(), 2),
                 "hold_s": round(source.quality_hold_s(), 3),
                 "confirmed": source.quality_confirmed(),
+                "rate_limit": rate_limit,
             },
         }
     )
     if not source.quality_confirmed():
         violations.append("quality_not_confirmed")
         return {"ok": False, "steps": steps, "violations": violations, "stage": "quality"}
-
-    flow = network.baseline_t_h() * max(0.0, min(1.0, demand_pct / 100.0))
-    try:
-        source.set_flow(flow)
-    except PlantError as error:
-        violations.append(error.message)
+    if abs(source.flow_t_h() - flow_target) > 1e-6:
+        violations.append("quantity_not_reached")
         return {"ok": False, "steps": steps, "violations": violations, "stage": "quantity"}
+
+    # 联动到位之后一次网才跟随，顺序不能反过来。
     network.set_supply(source.temperature_c())
     network.set_return(loop.return_c())
     network.set_flow(source.flow_t_h())
@@ -102,4 +121,5 @@ def startup_plant(
         "flow_t_h": round(source.flow_t_h(), 2),
         "supply_c": round(source.temperature_c(), 2),
         "return_c": round(loop.return_c(), 2),
+        "rate_limit": rate_limit,
     }

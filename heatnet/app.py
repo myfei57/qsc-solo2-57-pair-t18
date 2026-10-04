@@ -115,6 +115,7 @@ class Platform:
 
         self._cycles = 0
         self._operations = 0
+        self._demand_pct = 60.0
         self._lock = threading.RLock()
         self._register_namespaces()
         self._restore()
@@ -296,6 +297,7 @@ class Platform:
 
         with self._lock:
             op_id = self.ids.next()
+            self._demand_pct = float(demand_pct)
             report = startup_plant(
                 self.source,
                 self.curve,
@@ -350,27 +352,54 @@ class Platform:
             return {**report, **summary}
 
     def adjust_source(
-        self, temperature_c: float, flow_t_h: float, origin: str = "manual"
+        self,
+        temperature_c: float,
+        flow_t_h: float,
+        origin: str = "manual",
+        dt_s: float = 1.0,
+        demand_pct: float | None = None,
     ) -> dict:
-        """把热源供温与流量原子地调整到目标值。"""
+        """登记调质调量目标并按固定联合限速带走一个联动步。
+
+        目标越物理界整次请求作废；提议越出联合允许带则本周期不写温度与流量，
+        但目标保留，后续控制周期继续按限速逼近。流量回读缺失时只许降不许升。
+        """
 
         with self._lock:
-            adjustment: Adjustment = apply_adjustment(self.source, temperature_c, flow_t_h, origin)
-            if adjustment.ok:
+            demand = self._demand_pct if demand_pct is None else float(demand_pct)
+            adjustment: Adjustment = apply_adjustment(
+                self.source,
+                temperature_c,
+                flow_t_h,
+                dt_s=dt_s,
+                demand_pct=demand,
+                origin=origin,
+                readback_missing=self.network.readback_missing(),
+            )
+            if adjustment.applied:
                 self.network.set_supply(adjustment.temperature_c)
                 self.network.set_flow(adjustment.flow_t_h)
+            rate = adjustment.rate_limit or {}
             self.bus.publish(
                 Event.of(
                     "source",
                     "source",
-                    "adjust",
-                    severity="notice" if adjustment.ok else "warning",
-                    message=f"热源调整 {origin}",
+                    "joint_adjust",
+                    severity="notice" if adjustment.ok else "alarm",
+                    message=f"热源联动调整 {origin}" if adjustment.ok else f"热源联动调整被拒绝 {origin}",
                     origin=origin,
                     ok=adjustment.ok,
+                    applied=adjustment.applied,
                     temperature_c=round(adjustment.temperature_c, 2),
                     flow_t_h=round(adjustment.flow_t_h, 2),
+                    target_temperature_c=round(adjustment.target_temperature_c, 2),
+                    target_flow_t_h=round(adjustment.target_flow_t_h, 2),
+                    degraded=adjustment.degraded,
                     violations=list(adjustment.violations),
+                    band_kind=rate.get("band_kind"),
+                    load_segment=rate.get("load_segment"),
+                    yield_to=rate.get("yield_to"),
+                    leader=rate.get("leader"),
                 )
             )
             self._persist()
@@ -389,6 +418,7 @@ class Platform:
             selected = list(zones) if zones else self.zones.names()
             setpoint = self.config.station.setpoint_c if target_c is None else float(target_c)
             op_id = self.ids.next()
+            self._demand_pct = float(demand_pct)
             report = dispatch_demand(
                 self.service,
                 self.mapping,
@@ -420,6 +450,46 @@ class Platform:
                 )
             )
             return report
+
+    def report_flow_readback(self, present: bool, measured_t_h: float | None = None) -> dict:
+        """登记一次网流量回读状态。
+
+        回读缺失属于部分失败：联动限速进入只许降不许升的降级模式；回读恢复时
+        可带上恢复后的实测读值。状态变化落审计。
+        """
+
+        with self._lock:
+            before = self.network.readback_missing()
+            live = self.network.report_flow_readback(present, measured_t_h)
+            missing = not live
+            if missing != before:
+                self.bus.publish(
+                    Event.of(
+                        "primary",
+                        "primary",
+                        "flow_readback_lost" if missing else "flow_readback_restored",
+                        severity="alarm" if missing else "notice",
+                        message="流量回读缺失，联动进入只许降不许升" if missing else "流量回读恢复",
+                        readback_missing=missing,
+                        flow_t_h=round(self.network.flow_t_h(), 2),
+                    )
+                )
+            return {
+                "ok": True,
+                "readback_missing": missing,
+                "flow_t_h": round(self.network.flow_t_h(), 2),
+            }
+
+    def joint_rate_report(self, dt_s: float = 1.0) -> dict:
+        """按当前状态预演联合限速矩形（不写任何字段），供控制台展示。"""
+
+        with self._lock:
+            limit = self.source.rate_limit_for(
+                dt_s, self._demand_pct, readback_missing=self.network.readback_missing()
+            )
+            payload = limit.as_dict()
+            payload["last_applied"] = self.source.snapshot().rate_limit
+            return payload
 
     def retrofit_baseline(self, target_kpa: float) -> dict:
         """下发一次定压基线改造。"""
@@ -625,9 +695,36 @@ class Platform:
             self._cycles += 1
             self.clock.sleep(dt)
             moment = self.clock.now()
-            flow = self.source.flow_t_h() or self.network.flow_t_h()
             report = advance_heating(
-                self.source, self.curve, self.network, self.secondary, flow, moment, dt
+                self.source,
+                self.curve,
+                self.network,
+                self.secondary,
+                self._demand_pct,
+                moment,
+                dt,
+            )
+            rate = report.get("rate_limit") or self.source.snapshot().rate_limit or {}
+            # 联动限速供控制台展示并落审计：裁决、供温、审计共用同一份字典。
+            self.bus.publish(
+                Event.of(
+                    "source",
+                    "source",
+                    "joint_rate_limit",
+                    severity="alarm" if report["violations"] else "notice",
+                    message="联动限速裁决" + ("（有违约）" if report["violations"] else ""),
+                    cycle=self._cycles,
+                    ok=bool(report["ok"]),
+                    temperature_c=round(self.source.temperature_c(), 2),
+                    flow_t_h=round(self.source.flow_t_h(), 2),
+                    violations=list(report["violations"]),
+                    **{
+                        key: rate.get(key)
+                        for key in ("band_kind", "load_segment", "yield_to", "leader", "degraded")
+                    },
+                    allowed_band=rate.get("allowed_band"),
+                    targets=rate.get("targets"),
+                )
             )
             self.trend.append("supply_c", moment, self.source.temperature_c())
             self.trend.append("return_c", moment, self.secondary.return_c())
@@ -785,6 +882,14 @@ class Platform:
                 "limits": [self.config.source.flow_min_t_h, self.config.source.flow_max_t_h],
                 "quality_confirmed": self.source.quality_confirmed(),
                 "trips": self.source.trips(),
+                "joint_band": {
+                    "band_kind": "fixed",
+                    "temp_band_c": self.config.source.joint_temp_band_c,
+                    "flow_band_t_h": self.config.source.joint_flow_band_t_h,
+                    "ignite_flow_t_h": self.config.source.ignite_flow_t_h,
+                    "high_load_pct": self.config.source.high_load_pct,
+                },
+                "demand_pct": round(self._demand_pct, 2),
             },
             "curve": self.curve_report(),
             "primary": {

@@ -47,6 +47,7 @@ class Api:
         add("GET", "/api/valves", self._valves)
         add("GET", "/api/curve", self._curve)
         add("GET", "/api/forecast", self._forecast)
+        add("GET", "/api/rate-limit", self._rate_limit)
         add("GET", "/api/pressure", self._pressure)
         add("GET", "/api/quota", self._quota)
         add("GET", "/api/billing", self._billing)
@@ -65,6 +66,7 @@ class Api:
         add("POST", "/api/dispatch", self._dispatch)
         add("POST", "/api/cycle", self._cycle)
         add("POST", "/api/calibrate", self._calibrate)
+        add("POST", "/api/flow-readback", self._flow_readback)
         add("POST", "/api/retrofit", self._retrofit)
         add("POST", "/api/secondary/cycle", self._secondary_cycle)
         add("POST", "/api/meter", self._meter)
@@ -169,6 +171,10 @@ class Api:
             None if outside is None else float(outside), steps=horizon
         )
 
+    def _rate_limit(self, params: dict, body: dict) -> dict:
+        dt_s = float(params.get("dt_s", 1.0))
+        return self._platform.joint_rate_report(dt_s=dt_s)
+
     def _pressure(self, params: dict, body: dict) -> dict:
         return self._platform.pressure_report()
 
@@ -237,6 +243,7 @@ class Api:
             "curve_fresh": not platform.curve.is_stale(platform.clock.now()),
             "source_online": platform.source.state() == "online",
             "flow_above_threshold": not platform.network.low_flow(),
+            "flow_readback_live": not platform.network.readback_missing(),
             "pressure_in_band": not platform.secondary.needs_makeup()
             and not platform.secondary.overpressure(),
         }
@@ -257,9 +264,11 @@ class Api:
 
     def _adjust(self, params: dict, body: dict) -> dict:
         return self._platform.adjust_source(
-            _as_float(body, "temperature_c", self._platform.source.temperature_c()),
-            _as_float(body, "flow_t_h", self._platform.network.baseline_t_h()),
+            _as_float(body, "temperature_c", self._platform.source.target_c()),
+            _as_float(body, "flow_t_h", self._platform.source.target_flow_t_h()),
             str(body.get("origin", "console")),
+            dt_s=_as_float(body, "dt_s", 1.0),
+            demand_pct=None if body.get("demand_pct") is None else _as_float(body, "demand_pct", 60.0),
         )
 
     def _startup(self, params: dict, body: dict) -> dict:
@@ -289,6 +298,13 @@ class Api:
     def _calibrate(self, params: dict, body: dict) -> dict:
         measured = _as_float(body, "measured_t_h", self._platform.network.baseline_t_h())
         return self._platform.calibrate_flow(measured)
+
+    def _flow_readback(self, params: dict, body: dict) -> dict:
+        present = bool(body.get("present", True))
+        measured = body.get("measured_t_h")
+        return self._platform.report_flow_readback(
+            present, None if measured is None else float(measured)
+        )
 
     def _retrofit(self, params: dict, body: dict) -> dict:
         target = _as_float(body, "baseline_kpa", self._platform.pressure.baseline.value_kpa())

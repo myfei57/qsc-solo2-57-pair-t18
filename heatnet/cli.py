@@ -95,6 +95,17 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     queued = platform.queue_commands(args.station, [55.0, 62.0], "demo-operator")
     replayed = platform.replay_valves([args.station])
     disturbance = platform.disturb_secondary(args.disturb)
+    # 流量回读缺失演练：升流量被当场拒绝（只许降不许升），降流量放行，随后恢复。
+    readback_lost = platform.report_flow_readback(False)
+    live_flow = platform.source.flow_t_h()
+    readback_reject = platform.adjust_source(
+        platform.source.temperature_c(), live_flow + 60.0, "demo-readback"
+    )
+    readback_down = platform.adjust_source(
+        platform.source.temperature_c(), max(platform.config.source.flow_min_t_h, live_flow - 55.0),
+        "demo-readback",
+    )
+    readback_restored = platform.report_flow_readback(True, readback_down["flow_t_h"])
     concurrency = platform.concurrency_probe(rounds=args.rounds)
     trip = platform.trip("demo-complete")
     reset = platform.reset_source("demo-operator")
@@ -125,6 +136,13 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "queued": queued,
         "replayed": {key: replayed[key] for key in ("ok", "replayed", "applied")},
         "disturbance": disturbance,
+        "readback": {
+            "lost": readback_lost,
+            "raise_rejected": not readback_reject["ok"],
+            "raise_violations": readback_reject["violations"],
+            "down_applied": readback_down["applied"],
+            "restored": readback_restored,
+        },
         "concurrency": concurrency,
         "trip": {key: trip[key] for key in ("ok", "state", "reason", "trips")},
         "reset": {key: reset[key] for key in ("ok", "state")},

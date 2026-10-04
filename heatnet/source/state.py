@@ -13,9 +13,11 @@ class SourceSnapshot:
     temperature_c: float
     flow_t_h: float
     target_c: float
+    target_flow_t_h: float
     quality_hold_s: float
     adjustments: int
     trip_reason: str
+    rate_limit: dict | None
 
     def as_dict(self) -> dict:
         return {
@@ -23,7 +25,9 @@ class SourceSnapshot:
             "temperature_c": round(self.temperature_c, 2),
             "flow_t_h": round(self.flow_t_h, 2),
             "target_c": round(self.target_c, 2),
+            "target_flow_t_h": round(self.target_flow_t_h, 2),
             "quality_hold_s": round(self.quality_hold_s, 3),
             "adjustments": self.adjustments,
             "trip_reason": self.trip_reason,
+            "rate_limit": self.rate_limit,
         }

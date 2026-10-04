@@ -42,7 +42,12 @@ def _number(section: Mapping[str, Any], key: str, *, minimum: float | None = Non
 
 @dataclass(frozen=True)
 class SourceLimits:
-    """热源供温带、流量边界与调质确认约束。"""
+    """热源供温带、流量边界、调质确认与联合限速约束。
+
+    联合限速带型定死为固定带：``joint_temp_band_c`` 是温度领先段的固定温差带，
+    ``joint_flow_band_t_h`` 是流量领先段的固定流差带；``high_load_pct`` 定死
+    负荷段分界；``ignite_flow_t_h`` 是供温进带后允许的一步点火流量。
+    """
 
     supply_target_c: float
     supply_max_c: float
@@ -51,6 +56,11 @@ class SourceLimits:
     flow_max_t_h: float
     quality_confirm_s: float
     adjust_rate_c_s: float
+    adjust_rate_t_h_s: float
+    joint_temp_band_c: float
+    joint_flow_band_t_h: float
+    ignite_flow_t_h: float
+    high_load_pct: float
 
     @classmethod
     def from_mapping(cls, section: Mapping[str, Any]) -> "SourceLimits":
@@ -62,6 +72,11 @@ class SourceLimits:
             flow_max_t_h=_number(section, "flow_max_t_h", minimum=1.0),
             quality_confirm_s=_number(section, "quality_confirm_s", minimum=0.1),
             adjust_rate_c_s=_number(section, "adjust_rate_c_s", minimum=0.01),
+            adjust_rate_t_h_s=_number(section, "adjust_rate_t_h_s", minimum=0.01),
+            joint_temp_band_c=_number(section, "joint_temp_band_c", minimum=0.1),
+            joint_flow_band_t_h=_number(section, "joint_flow_band_t_h", minimum=0.1),
+            ignite_flow_t_h=_number(section, "ignite_flow_t_h", minimum=1.0),
+            high_load_pct=_number(section, "high_load_pct", minimum=0.0),
         )
         if limits.supply_target_c >= limits.supply_max_c:
             raise ConfigError("热源目标供温必须低于上限", component="config")
@@ -69,6 +84,10 @@ class SourceLimits:
             raise ConfigError("回水下限必须低于目标供温", component="config")
         if limits.flow_min_t_h >= limits.flow_max_t_h:
             raise ConfigError("流量下限必须小于上限", component="config")
+        if not limits.flow_min_t_h <= limits.ignite_flow_t_h <= limits.flow_max_t_h:
+            raise ConfigError("点火流量必须落在流量可信区间内", component="config")
+        if not 0.0 < limits.high_load_pct < 100.0:
+            raise ConfigError("高负荷分界必须落在开区间 (0, 100) 内", component="config")
         return limits
 
     def overtemperature(self, temperature_c: float) -> bool:
@@ -336,7 +355,9 @@ def default_config() -> PlatformConfig:
     return PlatformConfig(
         name="heatnet",
         storage_root="var/state",
-        source=SourceLimits(92.0, 115.0, 35.0, 900.0, 4200.0, 12.0, 0.35),
+        source=SourceLimits(
+            92.0, 115.0, 35.0, 900.0, 4200.0, 12.0, 0.35, 55.0, 6.0, 600.0, 900.0, 75.0
+        ),
         curve=CurveLimits(-26.0, 18.0, 55.0, 95.0, 1800.0),
         station=StationLimits(60.0, 2.5, 9.0, 8.0),
         primary=PrimaryLimits(2400.0, 180.0, 4.0),
@@ -362,6 +383,11 @@ def config_to_mapping(cfg: PlatformConfig) -> dict:
                 "flow_max_t_h": cfg.source.flow_max_t_h,
                 "quality_confirm_s": cfg.source.quality_confirm_s,
                 "adjust_rate_c_s": cfg.source.adjust_rate_c_s,
+                "adjust_rate_t_h_s": cfg.source.adjust_rate_t_h_s,
+                "joint_temp_band_c": cfg.source.joint_temp_band_c,
+                "joint_flow_band_t_h": cfg.source.joint_flow_band_t_h,
+                "ignite_flow_t_h": cfg.source.ignite_flow_t_h,
+                "high_load_pct": cfg.source.high_load_pct,
             },
             "curve": {
                 "outdoor_min_c": cfg.curve.outdoor_min_c,

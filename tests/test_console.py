@@ -58,9 +58,26 @@ def test_api_weather_adjust_and_readiness(platform):
     status, weather = api.handle("POST", "/api/weather", {}, {"outdoor_c": -9.0})
     assert status == 200
     assert weather["ok"] is True
-    status, adjusted = api.handle("POST", "/api/adjust", {}, {"temperature_c": 88.0, "flow_t_h": 1500.0})
+    # 一步喊到目标温度/流量会越固定联合限速带：目标登记、本步拒绝、字段不动。
+    status, rejected = api.handle("POST", "/api/adjust", {}, {"temperature_c": 88.0, "flow_t_h": 1500.0})
+    assert status == 200
+    assert rejected["ok"] is False
+    assert rejected["applied"] is False
+    assert "joint_rate_band_exceeded" in rejected["violations"]
+    assert rejected["rate_limit"]["band_kind"] == "fixed"
+    # 带内的小步调整当场生效。
+    current = platform.source.temperature_c()
+    status, adjusted = api.handle(
+        "POST", "/api/adjust", {}, {"temperature_c": round(current + 0.3, 2), "flow_t_h": 0.0}
+    )
     assert status == 200
     assert adjusted["ok"] is True
+    assert adjusted["applied"] is True
+    # 联合限速矩形可直接查询供控制台展示。
+    status, rate = api.handle("GET", "/api/rate-limit", {}, {})
+    assert status == 200
+    assert rate["band_kind"] == "fixed"
+    assert "allowed_band" in rate
     status, ready = api.handle("GET", "/api/readiness", {}, {})
     assert status == 200
     assert ready["checks"]["curve_fresh"] is True

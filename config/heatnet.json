@@ -11,7 +11,12 @@
       "flow_min_t_h": 900.0,
       "flow_max_t_h": 4200.0,
       "quality_confirm_s": 12.0,
-      "adjust_rate_c_s": 0.35
+      "adjust_rate_c_s": 0.35,
+      "adjust_rate_t_h_s": 55.0,
+      "joint_temp_band_c": 6.0,
+      "joint_flow_band_t_h": 600.0,
+      "ignite_flow_t_h": 900.0,
+      "high_load_pct": 75.0
     },
     "curve": {
       "outdoor_min_c": -26.0,
